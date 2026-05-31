@@ -1,0 +1,7 @@
+cd D:\ITFaculty\Seme6\PBL5\Server
+
+D:\PYCHARM\python.exe server.py
+
+cd C:\Users\MY PC\Downloads\ngrok-v3-stable-windows-amd64
+
+.\ngrok.exe http 8000
