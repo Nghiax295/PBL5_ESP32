@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Smart Home Voice Control</title>
+    <script src="./mqtt.js" type="text/javascript"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/RecordRTC/5.6.2/RecordRTC.min.js"></script>
+    <style>
+        /* GIỮ NGUYÊN CSS */
+        * { box-sizing: border-box; font-family: system-ui, 'Segoe UI', 'Roboto', sans-serif; }
+        body { background: #f0f7ff; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; color: #1e3c72; margin-bottom: 10px; }
+        .status-bar { background: white; border-radius: 20px; padding: 12px 20px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; }
+        .connection-status { font-weight: bold; padding: 4px 12px; border-radius: 20px; background: #e0e0e0; }
+        .connection-status.online { background: #4caf50; color: white; }
+        .connection-status.offline { background: #f44336; color: white; }
+        .voice-section { display: flex; align-items: center; gap: 15px; }
+        .mic-btn { background: #ff9800; border: none; border-radius: 50px; padding: 10px 20px; font-size: 18px; font-weight: bold; color: white; cursor: pointer; transition: 0.2s; box-shadow: 0 2px 5px rgba(0,0,0,0.2); user-select: none; -webkit-user-select: none; }
+        .mic-btn.listening { background: #f44336; transform: scale(1.02); }
+        .voice-feedback { background: #f5f5f5; padding: 8px 15px; border-radius: 30px; font-style: italic; color: #555; }
+        .sensor-panel { background: linear-gradient(135deg, #1e3c72, #2b4c7c); color: white; border-radius: 20px; padding: 15px 20px; margin-bottom: 25px; display: flex; flex-wrap: wrap; justify-content: space-around; gap: 15px; }
+        .sensor-card { background: rgba(255,255,255,0.15); border-radius: 16px; padding: 8px 20px; text-align: center; min-width: 100px; }
+        .sensor-card .label { font-size: 14px; opacity: 0.9; }
+        .sensor-card .value { font-size: 24px; font-weight: bold; }
+        .warning { background: #ffeb3b; color: #b71c1c; font-weight: bold; padding: 8px; border-radius: 12px; text-align: center; margin-bottom: 20px;}
+        .rooms-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+        .room-card { background: white; border-radius: 24px; padding: 16px; box-shadow: 0 5px 15px rgba(0,0,0,0.08); transition: 0.2s; }
+        .room-title { font-size: 22px; font-weight: bold; margin-bottom: 15px; border-left: 5px solid #ff9800; padding-left: 12px; color: #1e3c72; }
+        .device-row { display: flex; justify-content: space-between; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+        .device-name { font-weight: 500; display: flex; align-items: center; gap: 8px; }
+        button { background: #e0e0e0; border: none; border-radius: 30px; padding: 6px 16px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button.on { background: #4caf50; color: white; }
+        button.off { background: #f44336; color: white; }
+        button:active { transform: scale(0.96); }
+        .two-buttons { display: flex; gap: 8px; }
+        @media (max-width: 600px) { .sensor-panel { flex-direction: column; align-items: center; } .room-card { padding: 12px; } .device-row { gap: 10px; } }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🏠 Điều khiển nhà thông minh</h1>
+
+    <div class="status-bar">
+        <div>
+            <span>☁️ Cloud: </span>
+            <span id="connStatus" class="connection-status offline">Đang kết nối...</span>
+        </div>
+        
+        <button onclick="alert('Tính năng Reset WiFi bị vô hiệu hóa khi dùng qua Cloud để tránh mất kết nối vĩnh viễn.')" style="background:#ccc; color:#666; border:none; border-radius:20px; padding:6px 14px; font-weight:bold; cursor:not-allowed;">
+            🔄 Reset WiFi
+        </button>
+
+        <div class="voice-section">
+            <button id="micButton" class="mic-btn">🎤 Nhấn giữ & nói</button>
+            <!-- <div id="voiceFeedback" class="voice-feedback">Sẵn sàng</div> -->
+        </div>
+    </div>
+
+    <div class="sensor-panel" id="sensorPanel">
+        <div class="sensor-card"><div class="label">🌡️ Nhiệt độ</div><div class="value" id="tempVal">--</div></div>
+        <div class="sensor-card"><div class="label">💧 Độ ẩm</div><div class="value" id="humVal">--</div></div>
+        <div class="sensor-card"><div class="label">🔥 Khí gas</div><div class="value" id="gasVal">--</div></div>
+    </div>
+    <div id="gasWarning" style="display: none;" class="warning">⚠️ CẢNH BÁO RÒ RỈ GAS! ⚠️</div>
+
+    <div class="rooms-grid" id="roomsContainer"></div>
+</div>
+
+<script>
+    // === CẤU HÌNH SERVER AI VÀ MQTT ===
+    // Sửa IP "localhost" thành IP LAN của máy tính chạy file server.py nếu bạn dùng điện thoại để test
+    const AI_SERVER_URL = "https://dean-habitat-eatable.ngrok-free.dev/api/voice-audio"; 
+    const MQTT_SERVER = "d123b7d09f38491c940b762f943305ca.s1.eu.hivemq.cloud";
+    const MQTT_PORT = 8884; 
+    const MQTT_USER = "nghiadev295";
+    const MQTT_PASS = "Nghiadev295";
+    
+    const TOPIC_CONTROL = "pbl5/nhom4/control";
+    const TOPIC_STATUS  = "pbl5/nhom4/status";
+
+    // DOM elements
+    const connSpan = document.getElementById('connStatus');
+    const micBtn = document.getElementById('micButton');
+    const voiceFeedback = document.getElementById('voiceFeedback');
+    const tempSpan = document.getElementById('tempVal');
+    const humSpan = document.getElementById('humVal');
+    const gasSpan = document.getElementById('gasVal');
+    const gasWarningDiv = document.getElementById('gasWarning');
+
+    // State
+    let mqttClient = null;
+    let currentState = {
+        living: { light: false, fan: false, door: false, curtain: false },
+        bedroom: { light: false, fan: false, door: false, curtain: false },
+        kitchen: { light: false, fan: false, door: false },
+        hallway: { light: false },
+        sensors: { temperature: 0, humidity: 0, gas: 0 }
+    };
+
+    // Gửi lệnh thủ công qua nút bấm trên Web
+    function sendCommand(room, device, action) {
+        if (!mqttClient || !mqttClient.isConnected()) {
+            alert("Chưa kết nối đến Cloud MQTT!");
+            return;
+        }
+        const payload = { room: room, device: device, action: action.toUpperCase() };
+        const message = new Paho.MQTT.Message(JSON.stringify(payload));
+        message.destinationName = TOPIC_CONTROL;
+        mqttClient.send(message);
+        
+        // Cập nhật UI tạm thời
+        try {
+            currentState[room][device] = (action.toUpperCase() === 'ON');
+            renderRooms();
+        } catch (e) {}
+    }
+
+    // === XỬ LÝ GHI ÂM (MediaRecorder) ===
+    // === XỬ LÝ GHI ÂM CHUẨN WAV (RecordRTC) ===
+    let recorder;
+
+    async function setupMic() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            
+            // Cấu hình ép định dạng chuẩn WAV và tần số 16000Hz khớp với model Keras
+            recorder = RecordRTC(stream, {
+                type: 'audio',
+                mimeType: 'audio/wav',
+                recorderType: StereoAudioRecorder,
+                desiredSampRate: 16000, 
+                numberOfAudioChannels: 1 // Ghi âm Mono (1 kênh) để AI dễ phân tích
+            });
+
+            // Bắt sự kiện chuột / Cảm ứng
+            micBtn.onmousedown = startRecording;
+            micBtn.onmouseup = stopRecording;
+            micBtn.onmouseleave = stopRecording; 
+            
+            micBtn.ontouchstart = (e) => { e.preventDefault(); startRecording(); };
+            micBtn.ontouchend = (e) => { e.preventDefault(); stopRecording(); };
+
+        } catch (err) {
+            console.error("Lỗi Micro:", err);
+            voiceFeedback.innerText = "❌ Không có quyền truy cập Micro";
+            micBtn.disabled = true;
+        }
+    }
+
+    function startRecording() {
+        if (recorder && recorder.getState() !== "recording") {
+            recorder.startRecording();
+            micBtn.classList.add('listening');
+            // voiceFeedback.innerText = "🎙️ Đang ghi âm (Buông ra để gửi)...";
+        }
+    }
+
+    function stopRecording() {
+        if (recorder && recorder.getState() === "recording") {
+            recorder.stopRecording(() => {
+                micBtn.classList.remove('listening');
+                // voiceFeedback.innerText = "⏳ Đang gửi lên AI phân tích...";
+                
+                // Lấy file audio chuẩn WAV vừa ghi xong
+                let blob = recorder.getBlob();
+                sendAudioToServer(blob);
+                
+                // Xóa bộ đệm sẵn sàng cho lần bấm tiếp theo
+                recorder.reset();
+            });
+        }
+    }
+
+    // === GỬI FILE GHI ÂM LÊN FASTAPI SERVER ===
+    async function sendAudioToServer(blob) {
+        const formData = new FormData();
+        formData.append("file", blob, "voice_command.wav"); // "file" phải khớp với tên biến trong FastAPI
+
+        try {
+            const response = await fetch(AI_SERVER_URL, {
+                method: "POST",
+                body: formData
+            });
+
+            const result = await response.json();
+            console.log("Server AI Trả về:", result);
+
+            if (result.status === "success") {
+                const cmd = result.command;
+                const conf = (result.confidence * 100).toFixed(1);
+                // voiceFeedback.innerText = `✅ Đã gửi lệnh MQTT: ${cmd.action} ${cmd.device} ở ${cmd.room} (${conf}%)`;
+                
+                // Mặc dù Server đã bắn lệnh MQTT, ta tự cập nhật UI web luôn cho mượt
+                if(currentState[cmd.room] !== undefined) {
+                    currentState[cmd.room][cmd.device] = (cmd.action === 'ON');
+                    renderRooms();
+                }
+            } else {
+                voiceFeedback.innerText = `❓ Lỗi từ AI: ${result.message}`;
+            }
+        } catch (error) {
+            console.error("Lỗi gửi Server API:", error);
+            voiceFeedback.innerText = "❌ Không thể kết nối với AI Server (Kiểm tra xem Python đã chạy chưa)";
+        }
+    }
+
+    // === KẾT NỐI MQTT CLOUD ===
+    function connectMQTT() {
+        const clientId = "WebApp_" + Math.random().toString(16).substr(2, 8);
+        mqttClient = new Paho.MQTT.Client(MQTT_SERVER, MQTT_PORT, "/mqtt", clientId);
+
+        mqttClient.onConnectionLost = onConnectionLost;
+        mqttClient.onMessageArrived = onMessageArrived;
+
+        const options = {
+            useSSL: true,
+            userName: MQTT_USER,
+            password: MQTT_PASS,
+            onSuccess: onConnect,
+            onFailure: onFailure
+        };
+        console.log("Đang kết nối tới HiveMQ Cloud...");
+        mqttClient.connect(options);
+    }
+
+    function onConnect() {
+        console.log("Đã kết nối MQTT Cloud thành công!");
+        connSpan.innerText = '✅ Đã kết nối';
+        connSpan.className = 'connection-status online';
+        mqttClient.subscribe(TOPIC_STATUS);
+    }
+
+    function onFailure(message) {
+        console.error("Lỗi kết nối MQTT: " + message.errorMessage);
+        connSpan.innerText = '❌ Lỗi kết nối';
+        connSpan.className = 'connection-status offline';
+        setTimeout(connectMQTT, 5000);
+    }
+
+    function onConnectionLost(responseObject) {
+        if (responseObject.errorCode !== 0) {
+            connSpan.innerText = '🔌 Đang kết nối lại...';
+            connSpan.className = 'connection-status offline';
+        }
+    }
+
+    function onMessageArrived(message) {
+        if (message.destinationName === TOPIC_STATUS) {
+            try {
+                const data = JSON.parse(message.payloadString);
+                updateUI(data);
+            } catch (e) {
+                console.error('Lỗi parse JSON từ MQTT', e);
+            }
+        }
+    }
+
+    // === CẬP NHẬT GIAO DIỆN ===
+    function updateUI(data) {
+        if (data.living) currentState.living = { ...currentState.living, ...data.living };
+        if (data.bedroom) currentState.bedroom = { ...currentState.bedroom, ...data.bedroom };
+        if (data.kitchen) currentState.kitchen = { ...currentState.kitchen, ...data.kitchen };
+        if (data.hallway) currentState.hallway = { ...currentState.hallway, ...data.hallway };
+        if (data.sensors) currentState.sensors = { ...currentState.sensors, ...data.sensors };
+
+        tempSpan.innerText = currentState.sensors.temperature?.toFixed(1) ?? '--';
+        humSpan.innerText = currentState.sensors.humidity?.toFixed(1) ?? '--';
+        const gasVal = currentState.sensors.gas ?? 0;
+        gasSpan.innerText = gasVal;
+        
+        if (gasVal > 1500) gasWarningDiv.style.display = 'block';
+        else gasWarningDiv.style.display = 'none';
+
+        renderRooms();
+    }
+
+    function renderRooms() {
+        const container = document.getElementById('roomsContainer');
+        if (!container) return;
+
+        const roomsDef = [
+            { key: 'living', name: '🛋️ Phòng khách', devices: ['light', 'fan', 'door'] },
+            { key: 'bedroom', name: '🛏️ Phòng ngủ', devices: ['light', 'fan', 'door'] },
+            { key: 'kitchen', name: '🍳 Phòng bếp', devices: ['light', 'fan', 'door'] },
+            { key: 'hallway', name: '🚪 Hành lang', devices: ['light'] }
+        ];
+
+        let html = '';
+        for (let room of roomsDef) {
+            const state = currentState[room.key] || {};
+            html += `<div class="room-card"><div class="room-title">${room.name}</div>`;
+
+            for (let dev of room.devices) {
+                let displayName = ''; let icon = ''; let currentVal = state[dev] || false;
+                if (dev === 'light') { displayName = '💡 Đèn'; icon = 'light'; }
+                else if (dev === 'fan') { displayName = '🌀 Quạt'; icon = 'fan'; }
+                else if (dev === 'door') { displayName = '🚪 Cửa'; icon = 'door'; }
+
+                if (dev === 'door') {
+                    const isOpen = currentVal;
+                    html += `<div class="device-row">
+                                <div class="device-name">${icon} ${displayName}</div>
+                                <div class="two-buttons">
+                                    <button class="${isOpen ? 'on' : 'off'}" onclick="sendCommand('${room.key}', '${dev}', 'ON')">Mở</button>
+                                    <button class="${!isOpen ? 'on' : 'off'}" onclick="sendCommand('${room.key}', '${dev}', 'OFF')">Đóng</button>
+                                </div>
+                             </div>`;
+                } else {
+                    const isOn = currentVal;
+                    html += `<div class="device-row">
+                                <div class="device-name">${icon} ${displayName}</div>
+                                <button class="${isOn ? 'on' : 'off'}" onclick="sendCommand('${room.key}', '${dev}', '${isOn ? 'OFF' : 'ON'}')">
+                                    ${isOn ? 'Tắt' : 'Bật'}
+                                </button>
+                             </div>`;
+                }
+            }
+            html += `</div>`;
+        }
+        container.innerHTML = html;
+    }
+
+    function init() {
+        renderRooms();
+        connectMQTT(); 
+        setupMic(); 
+    }
+
+    init();
+</script>
+</body>
+</html>

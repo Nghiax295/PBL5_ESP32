@@ -12,6 +12,7 @@
 #include <ESP32Servo.h>
 #include <ESPmDNS.h>
 #include <PubSubClient.h>
+#include <Preferences.h>
 
 // CẤU HÌNH HIVEMQ CLOUD
 const char* mqtt_server = "d123b7d09f38491c940b762f943305ca.s1.eu.hivemq.cloud";
@@ -64,6 +65,11 @@ WebSocketsServer webSocket(81);
 WiFiClientSecure espClient; 
 PubSubClient mqttClient(espClient);
 
+// SAVE STATE (dùng cho khi ESP bị reset đột ngột, không mất trạng thái thiết bị)
+Preferences preferences;
+volatile bool needSave = false;
+SemaphoreHandle_t saveMutex;
+
 SemaphoreHandle_t stateMutex;
 
 // DEVICE STATES 
@@ -80,8 +86,34 @@ int gasValue = 0;
 unsigned long lastSensorRead = 0;
 const long sensorInterval = 1000;
 
-// Khai báo hàm điều khiển 
+// Khai báo hàm 
+void connectToWiFi();
+void resetWiFiAndRestart();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void controlLight(int pin, bool &stateVar, bool newState);
+void controlFan(int pin, bool &stateVar, bool newState);
+void openTheDoor(Servo &door, bool &stateVar, bool newState, int doorPin);
+void closeTheDoor(Servo &door, bool &stateVar, bool newState, int doorPin);
+void readSensors();
+void updateLCD();
+void sendSensorData();
+void broadcastDeviceStatus();
 void controlDevice(uint8_t * payload);
+void saveStates();
+void loadStates();
+void restoreDeviceStates();
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void handleControl();
+void handleGetState();
+void handleResetWiFi();
+void handleRoot();
+void TaskNetwork(void *pvParameters);
+void TaskSensor(void *pvParameters);
+void TaskLCD(void *pvParameters);
+void TaskHTTP(void *pvParameters);
+void TaskBroadcast(void *pvParameters);
+void TaskButtonCheck(void *pvParameters);
+void TaskSaveState(void *pvParameters);
 
 // WIFI CONNECTION WITH WIFIMANAGER 
 void connectToWiFi() {
@@ -106,6 +138,7 @@ void connectToWiFi() {
 // RESET WIFI FUNCTION 
 void resetWiFiAndRestart() {
     Serial.println("Resetting WiFi credentials and restarting...");
+    saveStates();
     WiFiManager wm;
     wm.resetSettings();  
     vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -131,6 +164,7 @@ void controlLight(int pin, bool &stateVar, bool newState) {
             digitalWrite(pin, newState ? HIGH : LOW);
             stateVar = newState;
             stateChanged = true;
+            needSave = true;
         }
         xSemaphoreGive(stateMutex);
     }
@@ -142,6 +176,7 @@ void controlFan(int pin, bool &stateVar, bool newState) {
             digitalWrite(pin, newState ? HIGH : LOW);
             stateVar = newState;
             stateChanged = true;
+            needSave = true;
         }
         xSemaphoreGive(stateMutex);
     }
@@ -154,6 +189,7 @@ void openTheDoor(Servo &door, bool &stateVar, bool newState, int doorPin) {
             stateVar = newState;
             stateChanged = true;
             needUpdate = true;
+            needSave = true;
         }
         xSemaphoreGive(stateMutex);
     }
@@ -172,6 +208,7 @@ void closeTheDoor(Servo &door, bool &stateVar, bool newState, int doorPin) {
             stateVar = newState;
             stateChanged = true;
             needUpdate = true;
+            needSave = true;
         }
         xSemaphoreGive(stateMutex);
     }
@@ -343,6 +380,92 @@ void controlDevice(uint8_t * payload) {
     }
 }
 
+// SAVE STATE
+void saveStates() {
+   bool livLight, livFan, livDoor, bedLight, bedFan, bebDoor, kitLight, kitFan, kitDoor, hallLight;
+   if(xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE){
+        livLight = livingLight;
+        livFan = livingFan;
+        livDoor = livingDoorOpen;
+        bedLight = bedroomLight;
+        bedFan = bedroomFan;
+        bebDoor = bedroomDoorOpen;
+        kitLight = kitchenLight;
+        kitFan = kitchenFan;
+        kitDoor = kitchenDoorOpen;
+        hallLight = hallwayLight;
+        xSemaphoreGive(stateMutex);
+   } else {
+        Serial.println("Failed to take stateMutex for saving states");
+        return;
+   }
+
+   if(xSemaphoreTake(saveMutex, portMAX_DELAY) == pdTRUE){
+        preferences.begin("smart_home", false);
+        preferences.putBool("livLight", livLight);
+        preferences.putBool("livFan", livFan);
+        preferences.putBool("livDoor", livDoor);
+        preferences.putBool("bedLight", bedLight);
+        preferences.putBool("bedFan", bedFan);
+        preferences.putBool("bebDoor", bebDoor);
+        preferences.putBool("kitLight", kitLight);
+        preferences.putBool("kitFan", kitFan);
+        preferences.putBool("kitDoor", kitDoor);
+        preferences.putBool("hallLight", hallLight);
+        preferences.end();
+        xSemaphoreGive(saveMutex);
+   } else {
+        Serial.println("Failed to take saveMutex for saving states");
+   }
+} 
+
+void loadStates(){
+    preferences.begin("smart_home", true);
+    livingLight = preferences.getBool("livLight", false);
+    livingFan = preferences.getBool("livFan", false);
+    livingDoorOpen = preferences.getBool("livDoor", false);
+    bedroomLight = preferences.getBool("bedLight", false);
+    bedroomFan = preferences.getBool("bedFan", false);
+    bedroomDoorOpen = preferences.getBool("bebDoor", false);
+    kitchenLight = preferences.getBool("kitLight", false);
+    kitchenFan = preferences.getBool("kitFan", false);
+    kitchenDoorOpen = preferences.getBool("kitDoor", false);
+    hallwayLight = preferences.getBool("hallLight", false);
+    preferences.end();
+
+}
+
+void restoreDeviceStates(){
+    digitalWrite(LIGHT_LIVING, livingLight);
+    digitalWrite(LIGHT_BEDROOM, bedroomLight);
+    digitalWrite(LIGHT_KITCHEN, kitchenLight);
+
+    digitalWrite(LIGHT_HALLWAY1, hallwayLight);
+    digitalWrite(LIGHT_HALLWAY2, hallwayLight);
+
+    digitalWrite(FAN_LIVING, livingFan);
+    digitalWrite(FAN_BEDROOM, bedroomFan);
+    digitalWrite(FAN_KITCHEN, kitchenFan);
+
+    doorLiving.write(
+        livingDoorOpen ? 30 : 115
+    );
+
+    doorBedroom.write(
+        bedroomDoorOpen ? 30 : 115
+    );
+
+    doorKitchen.write(
+        kitchenDoorOpen ? 30 : 115
+    );
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+
+    doorLiving.detach();
+    doorBedroom.detach();
+    doorKitchen.detach();
+}
+
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
     switch (type) {
         case WStype_DISCONNECTED:
@@ -417,6 +540,7 @@ void TaskNetwork(void *pvParameters) {
                     if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
                         Serial.println(" Thành Công!");
                         mqttClient.subscribe(topic_control); // Lắng nghe App gửi xuống
+                        broadcastDeviceStatus();
                     } else {
                         Serial.print(" Lỗi rc=");
                         Serial.println(mqttClient.state());
@@ -493,6 +617,25 @@ void TaskButtonCheck(void *pvParameters) {
     }
 }
 
+void TaskSaveState(void *pvParameters)
+{
+    static unsigned long lastSave = 0;
+    while (true)
+    {
+        if (needSave)
+        {
+            if (millis() - lastSave > 500)
+            {
+                saveStates();
+                needSave = false;
+                lastSave = millis();
+                Serial.println("States saved");
+            }
+        }
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
 // SETUP
 void setup() {
     Serial.begin(115200);
@@ -520,16 +663,11 @@ void setup() {
     doorKitchen.attach(DOOR_KITCHEN, 500, 2400);
 
     stateMutex = xSemaphoreCreateMutex();
+    saveMutex = xSemaphoreCreateMutex();
 
-    digitalWrite(LIGHT_LIVING, LOW); 
-    digitalWrite(LIGHT_BEDROOM, LOW);
-    digitalWrite(LIGHT_KITCHEN, LOW); 
-    digitalWrite(LIGHT_HALLWAY1, LOW);
-    digitalWrite(LIGHT_HALLWAY2, LOW);
+    loadStates();
 
-    digitalWrite(FAN_LIVING, LOW); 
-    digitalWrite(FAN_BEDROOM, LOW);
-    digitalWrite(FAN_KITCHEN, LOW);
+    restoreDeviceStates();
 
     connectToWiFi();
 
@@ -605,6 +743,15 @@ void setup() {
         NULL, 
         1, 
         NULL, 
+        1
+    );
+    xTaskCreatePinnedToCore(
+        TaskSaveState,
+        "TaskSaveState",
+        4000,
+        NULL,
+        1,
+        NULL,
         1
     );
 }
