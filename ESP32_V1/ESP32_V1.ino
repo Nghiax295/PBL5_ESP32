@@ -356,8 +356,7 @@ void controlDevice(uint8_t * payload) {
             controlLight(LIGHT_KITCHEN, kitchenLight, state);
         else if (room == "hallway") {
             controlLight(LIGHT_HALLWAY1, hallwayLight, state);
-            hallwayLight = !hallwayLight;
-            controlLight(LIGHT_HALLWAY2, hallwayLight, state);
+            digitalWrite(LIGHT_HALLWAY2, state);
         }
     } else if (device == "fan") {
         if (room == "living") 
