@@ -13,6 +13,9 @@
 #include <ESPmDNS.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+
 
 // CẤU HÌNH HIVEMQ CLOUD
 const char* mqtt_server = "d123b7d09f38491c940b762f943305ca.s1.eu.hivemq.cloud";
@@ -67,7 +70,6 @@ PubSubClient mqttClient(espClient);
 
 // SAVE STATE (dùng cho khi ESP bị reset đột ngột, không mất trạng thái thiết bị)
 Preferences preferences;
-volatile bool needSave = false;
 SemaphoreHandle_t saveMutex;
 
 SemaphoreHandle_t stateMutex;
@@ -78,13 +80,20 @@ bool bedroomLight = false, bedroomFan = false;
 bool kitchenLight = false, kitchenFan = false, kitchenFanGas = false;
 bool hallwayLight = false;
 bool livingDoorOpen = false, bedroomDoorOpen = false, kitchenDoorOpen = false;
-bool stateChanged = false;
-volatile bool sensorUpdated = false;
 
 float temperature = 0, humidity = 0;
 int gasValue = 0;
 unsigned long lastSensorRead = 0;
 const long sensorInterval = 1000;
+
+// EVENT_GROUPS
+EventGroupHandle_t systemEvents;
+
+#define SENSOR_UPDATED_BIT   (1 << 0) // 00000001
+#define STATE_CHANGED_BIT    (1 << 1) // 00000010
+#define SAVE_STATE_BIT       (1 << 2) // 00000100
+#define LCD_UPDATE_BIT       (1 << 3) // 00001000
+
 
 // KHAI BÁO HÀM
 void connectToWiFi();
@@ -163,8 +172,11 @@ void controlLight(int pin, bool &stateVar, bool newState) {
         if (stateVar != newState) {
             digitalWrite(pin, newState ? HIGH : LOW);
             stateVar = newState;
-            stateChanged = true;
-            needSave = true;
+            xEventGroupSetBits(
+                systemEvents,
+                STATE_CHANGED_BIT |
+                SAVE_STATE_BIT
+            );
         }
         xSemaphoreGive(stateMutex);
     }
@@ -175,8 +187,11 @@ void controlFan(int pin, bool &stateVar, bool newState) {
         if (stateVar != newState) {
             digitalWrite(pin, newState ? HIGH : LOW);
             stateVar = newState;
-            stateChanged = true;
-            needSave = true;
+            xEventGroupSetBits(
+                systemEvents,
+                STATE_CHANGED_BIT |
+                SAVE_STATE_BIT
+            );
         }
         xSemaphoreGive(stateMutex);
     }
@@ -187,9 +202,12 @@ void openTheDoor(Servo &door, bool &stateVar, bool newState, int doorPin) {
     if (xSemaphoreTake(stateMutex, portMAX_DELAY)) {
         if (stateVar != newState) {
             stateVar = newState;
-            stateChanged = true;
             needUpdate = true;
-            needSave = true;
+            xEventGroupSetBits(
+                systemEvents,
+                STATE_CHANGED_BIT |
+                SAVE_STATE_BIT
+            );
         }
         xSemaphoreGive(stateMutex);
     }
@@ -206,9 +224,12 @@ void closeTheDoor(Servo &door, bool &stateVar, bool newState, int doorPin) {
     if (xSemaphoreTake(stateMutex, portMAX_DELAY)) {
         if (stateVar != newState) {
             stateVar = newState;
-            stateChanged = true;
             needUpdate = true;
-            needSave = true;
+            xEventGroupSetBits(
+                systemEvents,
+                STATE_CHANGED_BIT |
+                SAVE_STATE_BIT
+            );
         }
         xSemaphoreGive(stateMutex);
     }
@@ -230,10 +251,15 @@ void readSensors() {
         temperature = t;
         humidity = h;
     }
-    
+
     // Moving average
     gasValue = 0.8 * gasValue + 0.2 * gas;
-    sensorUpdated = true;
+
+    xEventGroupSetBits(
+        systemEvents,
+        SENSOR_UPDATED_BIT |
+        LCD_UPDATE_BIT
+    );
 
     Serial.printf("Temperature: %.2f °C, Humidity: %.2f %%, Gas: %d\n", temperature, humidity, gasValue);
 
@@ -254,27 +280,23 @@ void readSensors() {
 
 // LCD UPDATE 
 void updateLCD() {
-    static unsigned long lastLCD = 0;
-    if (millis() - lastLCD > 1000) {
-        lcd.clear();
-        if (gasValue > GAS_THRESHOLD) {
-            lcd.setCursor(0, 0);
-            lcd.print("GAS LEAK !!!");
-            lcd.setCursor(0, 1);
-            lcd.print("CHECK NOW !!!");
-        } else {
-            lcd.setCursor(0, 0);
-            lcd.print("T:");
-            lcd.print(temperature, 1);
-            lcd.print((char)223);
-            lcd.print("C H:");
-            lcd.print(humidity, 0);
-            lcd.print("%");
-            lcd.setCursor(0, 1);
-            lcd.print("Gas:");
-            lcd.print(gasValue);
-        }
-        lastLCD = millis();
+    lcd.clear();
+    if (gasValue > GAS_THRESHOLD) {
+        lcd.setCursor(0, 0);
+        lcd.print("GAS LEAK !!!");
+        lcd.setCursor(0, 1);
+        lcd.print("CHECK NOW !!!");
+    } else {
+        lcd.setCursor(0, 0);
+        lcd.print("T:");
+        lcd.print(temperature, 1);
+        lcd.print((char)223);
+        lcd.print("C H:");
+        lcd.print(humidity, 0);
+        lcd.print("%");
+        lcd.setCursor(0, 1);
+        lcd.print("Gas:");
+        lcd.print(gasValue);
     }
 }
 
@@ -565,10 +587,17 @@ void TaskSensor(void *pvParameters) {
 }
 
 void TaskLCD(void *pvParameters) {
-    while (true) { 
-        if (sensorUpdated) 
-            updateLCD(); 
-        vTaskDelay(200 / portTICK_PERIOD_MS); 
+    while(true)
+    {
+        xEventGroupWaitBits(
+            systemEvents,
+            LCD_UPDATE_BIT,
+            pdTRUE,
+            pdFALSE,
+            portMAX_DELAY
+        );
+
+        updateLCD();
     }
 }
 
@@ -582,12 +611,20 @@ void TaskHTTP(void *pvParameters) {
 
 void TaskBroadcast(void *pvParameters) {
     while (true) {
-        if (sensorUpdated || stateChanged) {
+        EventBits_t bits =
+            xEventGroupWaitBits(
+                systemEvents,
+                SENSOR_UPDATED_BIT |
+                STATE_CHANGED_BIT,
+                pdTRUE,
+                pdFALSE,
+                pdMS_TO_TICKS(500)
+            );
+
+        if(bits)
+        {
             broadcastDeviceStatus();
-            sensorUpdated = false;
-            stateChanged = false;
         }
-        vTaskDelay(200 / portTICK_PERIOD_MS);
     }
 }
 
@@ -618,20 +655,28 @@ void TaskButtonCheck(void *pvParameters) {
 
 void TaskSaveState(void *pvParameters)
 {
-    static unsigned long lastSave = 0;
-    while (true)
+    while(true)
     {
-        if (needSave)
+        xEventGroupWaitBits(
+            systemEvents,
+            SAVE_STATE_BIT,
+            pdTRUE,
+            pdFALSE,
+            portMAX_DELAY
+        );
+
+        do
         {
-            if (millis() - lastSave > 500)
-            {
-                saveStates();
-                needSave = false;
-                lastSave = millis();
-                Serial.println("States saved");
-            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+        while(
+            xEventGroupGetBits(systemEvents)
+            & SAVE_STATE_BIT
+        );
+
+        saveStates();
+
+        Serial.println("States Saved");
     }
 }
 
@@ -663,6 +708,14 @@ void setup() {
 
     stateMutex = xSemaphoreCreateMutex();
     saveMutex = xSemaphoreCreateMutex();
+
+    systemEvents = xEventGroupCreate();
+
+    if(systemEvents == NULL)
+    {
+        Serial.println("Create EventGroup Failed!");
+        while(true);
+    }
 
     loadStates();
 
@@ -755,4 +808,10 @@ void setup() {
     );
 }
 
-void loop() {}
+void loop() {
+    // Thay thế các cờ sensorUpdated/stateChanged/needSave
+    // Thêm tín hiệu tác vụ dựa trên EventGroup
+    // Tối ưu hóa TaskLCD với cập nhật dựa trên sự kiện
+    // Thêm tính năng lưu trữ trạng thái trì hoãn để giảm ghi vào bộ nhớ flash
+    // Cải thiện giao tiếp tác vụ với EventGroup thay vì delay
+}
