@@ -756,4 +756,9 @@ void setup() {
     );
 }
 
-void loop() {}
+void loop() {
+    // Phiên bản này đã thêm tính năng
+    // lưu trạng thái thiết bị vào bộ nhớ flash 
+    // tránh khi ESP32 bị reset hay mất điện đột ngột
+    // sau khi trở lại thì sẽ khôi phục lại trạng thái cũ
+}
